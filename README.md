@@ -1,1 +1,1 @@
-# stat_error_MA_git
+# Evaluating the credibility of science  
