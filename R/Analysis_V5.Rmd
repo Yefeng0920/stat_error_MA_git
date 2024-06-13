@@ -1,0 +1,1007 @@
+---
+title: "Untitled"
+output: html_document
+date: '2024-05-22'
+---
+
+# Packages
+
+```{r, warning=FALSE, echo=TRUE}
+set.seed(2024)
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(tidyr) 
+  library(ggplot2)
+  library(metafor)
+  library(here)
+  library(RColorBrewer)
+  library(clubSandwich)
+  library(ggExtra)
+  library(cowplot)
+  library(patchwork)
+  library(aplot)
+  library(ggridges)
+  library(ggplotify) 
+  library(palettetown)
+  library(wesanderson)
+  library(ggpubr) 
+  library(zcurve)
+  library(flexmix)
+  library(weightr)
+  })
+```
+
+# Functions
+
+Load custom functions used to compute replicability, prior probability, statistical power, magnitude error, and sign error.
+
+```{r}
+# power (two-tail) for meta-analysis
+powerMA <- function(mu, SE, alpha = 0.05) {
+  1 - pnorm(qnorm(1 - 0.05 / 2) - abs(mu) / SE) + pnorm(-qnorm(1 - 0.05 / 2)-abs(mu) / SE)
+} 
+
+# S error for meta-analysis
+errorS <- function(mu, se, alpha = 0.05){
+  p.u <- 1 - pnorm(qnorm(1 - alpha/2) - abs(mu)/se) 
+  p.l <- pnorm(-qnorm(1 - alpha/2) - abs(mu)/se) 
+  power <- p.u + p.l 
+  errorS <- p.l/power 
+  return(errorS)
+} 
+
+errorM <- function(mu, se, alpha = 0.05, N = 1e5) {
+    est.random <- rnorm(n=N, mean = mu, sd = se)
+    sig.index <- suppressWarnings(abs(est.random) > se*qnorm(1 - alpha/2))
+    overestimate <- mean(abs(est.random)[sig.index])/abs(mu) 
+    absolute_error <- overestimate*abs(mu) - abs(mu)
+    relative_error <- absolute_error/(overestimate*abs(mu))
+  return(abs(overestimate) %>% round(3))
+}
+
+
+
+# meta-analysis of magnitude
+## folded effect size
+folded_es <-function(mean, variance){ # the sampling variance of magnitude   
+  mu <- mean
+  sigma <- sqrt(variance)
+  fold_mu <- sigma*sqrt(2/pi)*exp((-mu^2)/(2*sigma^2)) + mu*(1 - 2*pnorm(-mu/sigma))
+  fold_mu
+}
+## folded error
+folded_error <- function(mean, variance){ # the sampling variance of magnitude   
+  mu <- mean
+  sigma <- sqrt(variance)
+  fold_mu <- sigma*sqrt(2/pi)*exp((-mu^2)/(2*sigma^2)) + mu*(1 - 2*pnorm(-mu/sigma))
+  fold_se <- sqrt(mu^2 + sigma^2 - fold_mu^2)
+  # adding se to make bigger mean
+  fold_v <- fold_se^2
+  fold_v
+}
+
+# functions for the mixture distribution
+dmix = function(x,p,m,s){
+  drop(p %*% sapply(x, function(x) dnorm(x,mean=m,sd=s)))
+}
+
+rmix = function(n,p,m,s){    # sample from a normal mixture
+  d=rmultinom(n,1,p)
+  rnorm(n,m%*%d,s%*%d)
+}
+
+pmix = function(x,p,m,s){ # cumulative distr (vector x)
+  drop(p %*% sapply(x, function(x) pnorm(x,mean=m,sd=s)))
+}
+
+# p(SNR | z) when snr ~ dmix(p,m,s)
+posterior <- function(z,p,m,s) { 
+  s2=s # we estimate s of snr directly
+  p=p*dnorm(z,m,s2)  
+  p <- p/sum(p)         # conditional mixing probs
+  pm <- z*s2/(s2+1) + m/(s2+1) # conditional means
+  pv <- s2/(s2+1)          # conditional variances
+  ps <- sqrt(pv)            # conditional std devs
+  data.frame(p,pm,ps)
+}
+
+# function also accepts censoring below c1 and above c2.
+# uses base R function `constrOptim` to run constrained optimization. 
+# we define the log likelihood function and set up constraints such
+# that the mixture proportions are non-negative and add up to 1.
+mix = function(z, k = 3, c1 = 0, c2 = 10^6, weights = 1){
+  # log likelihood function
+  loglik = function(theta, z, k, weights = 1){
+    p = c(theta[1:(k-1)], 1 - sum(theta[1:(k-1)]))
+    s = theta[k:(2*k-1)]
+    m = rep(0, k)
+    lik1 = (abs(z) < c1) * (pmix(c1, p, m = m, s = s) - pmix(-c1, p, m = m, s = s))
+    lik2 = (abs(z) >= c1) * (abs(z) < c2) * dmix(z, p, m = m, s = s)
+    lik3 = (abs(z) >= c2) * (pmix(-c2, p, m = m, s = s) + 1 - pmix(c2, p, m = m, s = s))
+    lik = lik1 + lik2 + lik3
+    return(-sum(weights * log(lik)))   # *minus* the weighted log lik
+  }
+  
+  # set up constraints for optimization
+  # The feasible region is defined by ui %*% par - ci >= 0
+  ui = c(rep(-1, (k-1)), rep(0, k))         # (k-1) mixture props sum to < 1
+  ui = rbind(ui, diag(2*k-1))
+  ci = c(-1, rep(0, k-1), rep(0, k))        # Removed constraint about variances being at least 1
+  
+  # set starting value
+  theta0 = c(rep(1/k, (k-1)), c(1.2, 2:k))
+  opt = constrOptim(theta = theta0, f = loglik, ui = ui, ci = ci,
+                    method = "Nelder-Mead",
+                    z = z, weights = weights, k = k,
+                    control = list(maxit = 10^4))
+  
+  # collect the results
+  p = c(opt$par[1:(k-1)], 1 - sum(opt$par[1:(k-1)]))  # mixture proportions
+  sigma = opt$par[k:(2*k-1)]                          # mixture sds
+  m = rep(0, k)                                        # mixture means
+  df = data.frame(p = p, m = m, sigma = sigma)
+  return(df)
+}
+
+# probability of replication when the distribution is asymmetric (non zero-mean)
+replcalc2 <- function(zscore,p,m,sigma){ # compute replication probability (predictive power) when original study produced z
+  z=abs(zscore)
+  pr=dmix(z,p,m,sigma) / (dmix(z,p,m,sigma) + dmix(-z,p,m,sigma)) # pr(z >0 | |z|)
+  pr=drop(pr)
+  post=posterior(z,p,m,sigma) # p(SNR|z= |z|)
+  pm=post$pm
+  ps=post$ps
+  powpos=1 - pmix(1.96,p=post$p,m=pm,s=sqrt(ps^2 + 1)) # signif given z=|z|
+  post=posterior(-z,p,m,sigma) # p(SNR|z=-|z|)
+  pm=post$pm
+  ps=post$ps
+  powneg=pmix(-1.96,p=post$p,m=pm,s=sqrt(ps^2 + 1))   # signif given z=-|z|
+  return(as.numeric(pr*powpos + (1-pr)*powneg)) # signif given |z|
+}
+
+# probability of replication when the distribution is symmetric (zero-mean)
+replcalc <- function(z,p,m,s,multiplier=1){
+  post=posterior(abs(z),p=p,m=m,s=s)
+  pp=post$p
+  pm=sqrt(multiplier)*post$pm
+  ps=sqrt(multiplier)*post$ps
+  1 - pmix(1.96,p=pp,m=pm,s=sqrt(ps^2 + 1))
+}
+
+
+
+# odds ratio and base rate
+calcRodds <- function(FDR, pwr, alpha = 0.05) {
+  R = alpha * (1 - FDR) / (pwr * FDR)
+  Pr = R / (R + 1)
+  return(Pr)
+}
+
+```
+
+
+# Aims
+
+We aim to compute four indices:
+
+(1) Distribution of signal-noise-ratio (SNR)
+
+(2) Replicability of meta-analyses (meta-analytic mean effect size)
+
+(3) Power, magnitude error, and sign error
+
+(4) Base rate (pre-study probability)
+
+
+# Data
+
+Load the meta-analytic level point estimates and uncertainty provided by František.
+
+```{r}
+# summary information about individual meta-analyses
+studies_info <- readRDS(here("Dat", "studies_info.RDS"))
+# model estimates
+dat <- read.csv(here::here("Dat","est.csv"))
+names(dat)[3:7] <- c("mu_adj", "se_adj", "mu_unadj", "se_unadj", "discipline") 
+# SNR
+dat <- dat %>% mutate(z_adj = mu_adj / se_adj, z_unadj = mu_unadj / se_unadj)
+
+head(dat)
+```
+
+
+# Signal-noise-ratio (SNR)
+
+The first index we want to calculate is distribution (to be more precise, density) of SNR along with CIs, and central tendency (median and mean) of SNR to represent the average SNR. Such that we would reveal the strength of medical, environmental, economic, and psychological signal in contrast to statistical noise.
+
+We need to use Julia langue to compute CIs of the density of SNR. One statistician (Nikos Ignatiadis) taught me how to do it properly based on Dvoretzky-Kiefer-Wolfowitz F-Localization approach. Details can be found at his JASA paper: Ignatiadis N, Wager S. Confidence intervals for nonparametric empirical Bayes analysis[J]. Journal of the American Statistical Association, 2022, 117(539): 1149-1166.
+
+Given we need to use Julia, I am not gonna show the implementation for now. But I will provide all code later.
+
+The central tendency of SNR across disciplines: 
+```{r}
+# overall
+summary(abs(dat$z_adj))
+```
+
+Economics:
+```{r}
+# economics
+abs(filter(dat, discipline=="economics")$z_adj) %>% summary()
+```
+
+Environment:
+```{r}
+# environment
+abs(filter(dat, discipline=="environmental")$z_adj) %>% summary()
+```
+
+Psychology:
+```{r}
+# psychology
+abs(filter(dat, discipline=="psychology")$z_adj) %>% summary()
+```
+
+Medicine:
+```{r}
+# medicine
+abs(filter(dat, discipline=="medicine")$z_adj) %>% summary()
+```
+
+
+# Statistical error
+
+The second indicator is a set a statistical errors like Type II error (1 - power), Type M (magnitude) error, and Type S (sign) error.
+
+These statistical errors are easy to get given a z-score or SNR. For example, power is just a transformation of z-score (or p-value).
+
+```{r}
+# power
+dat <- dat %>% mutate(pwr_unadj = powerMA(mu = mu_unadj, SE = se_unadj),
+                      pwr_adj = powerMA(mu = mu_adj, SE = se_adj))
+# M
+M_unadj <- numeric(nrow(dat))
+for (i in 1:nrow(dat)) {
+  M_unadj[i] <- errorM(mu = dat$mu_unadj[i], se = dat$se_unadj[i])
+}
+dat$M_unadj <- M_unadj
+
+M_adj <- numeric(nrow(dat))
+for (i in 1:nrow(dat)) {
+  M_adj[i] <- errorM(mu = dat$mu_adj[i], se = dat$se_adj[i])
+}
+dat$M_adj <- M_adj
+
+# S
+S_unadj <- numeric(nrow(dat))
+for (i in 1:nrow(dat)) {
+  S_unadj[i] <- errorS(mu = dat$mu_unadj[i], se = dat$se_unadj[i])
+}
+dat$S_unadj <- S_unadj
+
+S_adj <- numeric(nrow(dat))
+for (i in 1:nrow(dat)) {
+  S_adj[i] <- errorS(mu = dat$mu_adj[i], se = dat$se_adj[i])
+}
+dat$S_adj <- S_adj
+
+# saveRDS(dat, here("Dat","dat.rds"))
+# dat <- readRDS(here("Dat","dat.rds"))
+```
+
+
+# Replicability
+
+Next index we want to calculate is the replicability of the meta-analysis (meta-analytic mean effect after adjusting publication bias). 
+
+Briefly, we define the signal-noise-ratio ($SNR$) as the strength of true meta-analytic mean effect (the signal) relative standard error of the effect size estimate:
+$$SNR = \mu / SE[\overline{\mu}]$$
+The PSB-adjured mean effect is a proxy for true effect. Then, we use the PSB-adjured mean effect to compute the SNR for each meta-analysis, and use a mixture model to estimate the marginal density of the SNR across more than 68,000 meta-analyse. Then we use the estimated distribution of the SNR to generate a large collection of z-score (z-score is just the SNR plus Gaussian error).
+
+## Modelling
+
+```{r}
+################################################
+#--------------------overall--------------------#
+################################################
+
+# fit the mixture model with non-zero mean
+fit_snr<- flexmix(dat$z_adj ~ 1, k = 8)
+# the weight (proportion), mean, and SD of the mixture component
+p <- summary(fit_snr)@comptab$prior 
+m <- parameters(fit_snr)[1,]
+sigma<- parameters(fit_snr)[2,]
+
+
+# visualize snr together with the fitted mixture
+x=seq(-6,6,0.01)
+n=length(dat$z_adj)
+df=data.frame(x,y=drop(dmix(x,p=p,m,s=sigma)))
+
+ggplot(dat, aes(x=z_adj)) +
+geom_histogram(aes(y = after_stat(density)), bins = 60, fill="white",col="black") +
+xlim(-6, 6) + theme_bw() + labs(x="SNR",y="Density") +
+geom_line(data=df,aes(x=x,y=y))
+
+
+################################################
+#--------------------economics--------------------#
+################################################
+dat_eco <- dat %>% filter(discipline == "economics")
+# fit the mixture model
+fit_snr_eco <- flexmix(dat_eco$z_adj ~ 1, k = 4)
+# the weight (proportion), mean, and SD of the mixture component
+p_eco <- summary(fit_snr_eco)@comptab$prior 
+m_eco <- parameters(fit_snr_eco)[1,]
+sigma_eco <- parameters(fit_snr_eco)[2,]
+
+# visualize snr together with the fitted mixture
+x=seq(-6,6,0.01)
+n=length(dat_eco$z_adj)
+df=data.frame(x,y=drop(dmix(x,p=p_eco,m_eco,s=sigma_eco)))
+
+ggplot(dat_eco, aes(x=z_adj)) +
+geom_histogram(aes(y = after_stat(density)), fill="white",col="black") +
+xlim(-6, 6) + theme_bw() + labs(x="SNR",y="Density") +
+geom_line(data=df,aes(x=x,y=y))
+
+
+################################################
+#--------------------environment--------------------#
+################################################
+dat_env <- dat %>% filter(discipline == "environmental")
+# fit the mixture model
+fit_snr_env <- flexmix(dat_env$z_adj ~ 1, k = 4)
+# the weight (proportion), mean, and SD of the mixture component
+p_env <- summary(fit_snr_env)@comptab$prior 
+m_env <- parameters(fit_snr_env)[1,]
+sigma_env <- parameters(fit_snr_env)[2,]
+
+# visualize snr together with the fitted mixture
+x=seq(-6,6,0.01)
+n=length(dat_env$z_adj)
+df=data.frame(x,y=drop(dmix(x,p=p_env,m_env,s=sigma_env)))
+
+ggplot(dat_env, aes(x=z_adj)) +
+geom_histogram(aes(y = after_stat(density)), bins = 20, fill="white",col="black") +
+xlim(-6, 6) + theme_bw() + labs(x="SNR",y="Density") +
+geom_line(data=df,aes(x=x,y=y))
+
+################################################
+#--------------------medicine--------------------#
+################################################
+dat_med <- dat %>% filter(discipline == "medicine")
+# fit the mixture model
+fit_snr_med <- flexmix(dat_med$z_adj ~ 1, k = 6)
+# the weight (proportion), mean, and SD of the mixture component
+p_med <- summary(fit_snr_med)@comptab$prior 
+m_med <- parameters(fit_snr_med)[1,]
+sigma_med <- parameters(fit_snr_med)[2,]
+
+# visualize snr together with the fitted mixture
+x=seq(-6,6,0.01)
+n=length(dat_med$z_adj)
+df=data.frame(x,y=drop(dmix(x,p=p_med,m_med,s=sigma_med)))
+
+ggplot(dat_med, aes(x=z_adj)) +
+geom_histogram(aes(y = after_stat(density)), bins = 30, fill="white",col="black") +
+xlim(-6, 6) + theme_bw() + labs(x="SNR",y="Density") +
+geom_line(data=df,aes(x=x,y=y))
+
+
+################################################
+#--------------------psychology--------------------#
+################################################
+dat_psy <- dat %>% filter(discipline == "psychology")
+# fit the mixture model
+fit_snr_psy <- flexmix(dat_psy$z_adj ~ 1, k = 6)
+# the weight (proportion), mean, and SD of the mixture component
+p_psy <- summary(fit_snr_psy)@comptab$prior 
+m_psy <- parameters(fit_snr_psy)[1,]
+sigma_psy <- parameters(fit_snr_psy)[2,]
+
+# visualize snr together with the fitted mixture
+x=seq(-6,6,0.01)
+n=length(dat_psy$z_adj)
+df=data.frame(x,y=drop(dmix(x,p=p_psy,m_psy,s=sigma_psy)))
+
+ggplot(dat_psy, aes(x=z_adj)) +
+geom_histogram(aes(y = after_stat(density)), bins = 30, fill="white",col="black") +
+xlim(-6, 6) + theme_bw() + labs(x="SNR",y="Density") +
+geom_line(data=df,aes(x=x,y=y))
+```
+
+## Estimation
+
+We use a simple Monte Carlo simulation to generate a size of 1e7 exact replications of meta-analytic mean effect sizes based on the estimated marginal density of the SNR.
+
+The replicability is the probability that an exact replication meta-analytic mean effect will obtain a two-sided P value less than 0.05 with the estimate in the same direction as the original meta-analysis. 
+
+```{r}
+################################################
+#--------------------overall--------------------#
+################################################
+# generate SNR
+snr=rmix(10^7,p=p,m=m,s=sigma)
+# replication
+z.orig=snr + rnorm(10^7) # original
+z.repl = snr + rnorm(10^7) # replication
+replicate=(z.orig * z.repl > 0) & (abs(z.repl) > 1.96)
+mean(replicate) # unconditional probability of replication
+mean(replicate[abs(z.orig)>1.96]) # conditional probability of replication given |z|>1.96
+
+################################################
+#--------------------economics--------------------#
+################################################
+# generate SNR
+snr_eco=rmix(10^7,p=p_eco,m=m_eco,s=sigma_eco)
+# replication
+z.orig_eco=snr_eco + rnorm(10^7) # original
+z.repl_eco = snr_eco + rnorm(10^7) # replication
+replicate_eco=(z.orig_eco * z.repl_eco > 0) & (abs(z.repl_eco) > 1.96)
+mean(replicate_eco) # unconditional probability of replication
+mean(replicate_eco[abs(z.orig_eco)>1.96]) # conditional probability of replication given |z|>1.96
+
+################################################
+#--------------------environment--------------------#
+################################################
+# generate SNR
+snr_env=rmix(10^7,p=p_env,m=m_env,s=sigma_env)
+# replication
+z.orig_env=snr_env + rnorm(10^7) # original
+z.repl_env = snr_env + rnorm(10^7) # replication
+replicate_env=(z.orig_env * z.repl_env > 0) & (abs(z.repl_env) > 1.96)
+mean(replicate_env) # unconditional probability of replication
+mean(replicate_env[abs(z.orig_env)>1.96]) # conditional probability of replication given |z|>1.96
+
+################################################
+#--------------------medicine--------------------#
+################################################
+# generate SNR
+snr_med=rmix(10^7,p=p_med,m=m_med,s=sigma_med)
+# replication
+z.orig_med=snr_med + rnorm(10^7) # original
+z.repl_med = snr_med + rnorm(10^7) # replication
+replicate_med=(z.orig_med * z.repl_med > 0) & (abs(z.repl_med) > 1.96)
+mean(replicate_med) # unconditional probability of replication
+mean(replicate_med[abs(z.orig_med)>1.96]) # conditional probability of replication given |z|>1.96
+
+################################################
+#--------------------psychology--------------------#
+################################################
+# generate SNR
+snr_psy=rmix(10^7,p=p_psy,m=m_psy,s=sigma_psy)
+# replication
+z.orig_psy=snr_psy + rnorm(10^7) # original
+z.repl_psy = snr_psy + rnorm(10^7) # replication
+replicate_psy=(z.orig_psy * z.repl_psy > 0) & (abs(z.repl_psy) > 1.96)
+mean(replicate_psy) # unconditional probability of replication
+mean(replicate_psy[abs(z.orig_psy)>1.96]) # conditional probability of replication given |z|>1.96
+```
+
+
+We can also compute the conditional probability of "successful replication" given the absolute value of the $z$-statistic of the original study. 
+
+```{r, echo=TRUE, warning=FALSE}
+replicate2=sapply(dat$z_adj,replcalc2,p=p,m=m,s=sigma)
+```
+
+We can verify the unconditional and conditional probability of "successful replication" by averaging over the empirical distribution.
+
+```{r, echo=TRUE}
+mean(replicate2) # unconditional probability of replication
+ind=which(dat$z_adj>1.96)
+mean(replicate2[ind]) # conditional probability of replication given |z|>1.96
+```
+
+Next, we build the relationship between typical statistical threshold (alpha) and replicability. 
+
+```{r, echo=TRUE, warning=FALSE}
+# typical alpha or p
+pval=c(0.1,0.05,0.01,0.001,0.0001)
+zval=qnorm(1 - pval/2)
+strength = c("No evidence", "Weak evidence","Moderate evidence",
+             "Strong evidence","Very strong evidence")
+strength = factor(strength,
+                  levels=c("No evidence", "Weak evidence",
+                           "Moderate evidence","Strong evidence",
+                           "Very strong evidence"))
+
+
+################################################
+#--------------------overall--------------------#
+################################################
+replicate <- sapply(zval,replcalc2,p=p,m=m,s=sigma)
+rep <- data.frame(strength,pval,zval,replicate)
+
+################################################
+#--------------------economics--------------------#
+################################################
+replicate <- sapply(zval,replcalc2,p=p_eco,m=m_eco,s=sigma_eco)
+rep_eco <- data.frame(strength,pval,zval,replicate)
+
+
+################################################
+#--------------------environment--------------------#
+################################################
+replicate <- sapply(zval,replcalc2,p=p_env,m=m_env,s=sigma_env)
+rep_env <- data.frame(strength,pval,zval,replicate)
+
+
+################################################
+#--------------------medicine--------------------#
+################################################
+replicate <- sapply(zval,replcalc2,p=p_med,m=m_med,s=sigma_med)
+rep_med <- data.frame(strength,pval,zval,replicate)
+
+
+################################################
+#--------------------psychology--------------------#
+################################################
+replicate <- sapply(zval,replcalc2,p=p_psy,m=m_psy,s=sigma_psy)
+rep_psy <- data.frame(strength,pval,zval,replicate)
+```
+
+
+# Prior odds
+
+We used a two-step approach to estimate prior odds (or prior probability or base rate). First, we estimate false discovery rate (FDR). Second, we use FDR to calculate prior odds.
+
+FDR can be approximated by Sorić’s approach and Jager and Leek’s approach. Details see below:
+
+introduction of Sorić’s approach (z-curve) estimating FDR:
+https://github.com/cran/zcurve
+
+introduction of Jager and Leek’s approach estimating FDR:
+https://bioconductor.org/packages/release/bioc/html/swfdr.html
+
+```{r}
+################################################
+#--------------------overall--------------------#
+################################################
+# get FDR 
+res <- zcurve(z = dat$z_adj, method = "EM", bootstrap = F) # assuming no publication bias zcurve(z = dat$z_adj, method = "EM", bootstrap = F, control = list(a = 0))
+#saveRDS(res, here("Dat","res.rds"))
+#res <- readRDS(here("Dat","res.rds"))
+res.est <- summary(res, all = TRUE)
+# get base rate
+calcRodds(res.est$coefficients[3], dat$pwr_adj) %>% summary()
+
+################################################
+#--------------------economics--------------------#
+################################################
+# get FDR 
+res_eco <- zcurve(z = dat_eco$z_adj, method = "EM", bootstrap = F) 
+#res_eco <- readRDS(here("Dat","res_eco.rds"))
+res_eco.est <- summary(res_eco, all = TRUE)
+# get base rate
+dat_eco$R <- calcRodds(res_eco.est$coefficients[3], dat_eco$pwr_adj)
+
+################################################
+#--------------------environment--------------------#
+################################################
+# get FDR 
+res_env <- zcurve(z = dat_env$z_adj, method = "EM", bootstrap = F) 
+#saveRDS(res_env, here("Dat","res_env.rds"))
+#res_env <- readRDS(here("Dat","res_env.rds")) 
+res_env.est <- summary(res_env, all = TRUE)
+# get base rate
+dat_env$R <- calcRodds(res_env.est$coefficients[3], dat_env$pwr_adj)
+
+
+################################################
+#--------------------medicine--------------------#
+################################################
+# get FDR 
+res_med <- zcurve(z = dat_med$z_adj, method = "EM", bootstrap = F) 
+#saveRDS(res_med, here("Dat","res_med.rds")) 
+#res_med <- readRDS(here("Dat","res_med.rds"))
+res_med.est <- summary(res_med, all = TRUE)
+# get base rate
+dat_med$R <- calcRodds(res_med.est$coefficients[3], dat_med$pwr_adj)
+
+
+################################################
+#--------------------psychology--------------------#
+################################################
+# get FDR 
+res_psy <- zcurve(z = dat_psy$z_adj, method = "EM", bootstrap = F) 
+#saveRDS(res_psy, here("Dat","res_psy.rds"))
+#res_psy <- readRDS(here("Dat","res_psy.rds"))
+res_psy.est <- summary(res_psy, all = TRUE)
+# get base rate
+dat_psy$R <- calcRodds(res_psy.est$coefficients[3], dat_psy$pwr_adj)
+```
+
+
+# Selective reporting
+
+We also identify the selective reporting at meta-analysis level. We use two approaches: selection model and test of excess statistical significance.
+
+## Selection model
+
+```{r}
+################################################
+#--------------------economics--------------------#
+################################################
+weightfunct(effect = dat_eco$mu_adj, v = dat_eco$se_adj^2, steps = c(.025,.10,.50,1), table = TRUE) 
+
+# alternatively, we can use selmodel() from metafor
+res_eco <- rma(yi = mu_adj, sei = se_adj, data = dat_eco)
+selmodel(res_eco, type="stepfun", steps=c(.025,.10,.50,1))
+
+
+################################################
+#--------------------environment--------------------#
+################################################
+
+weightfunct(effect = dat_env$mu_adj, v = dat_env$se_adj^2, steps = c(.025,.10,.50,1), table = TRUE)
+
+
+################################################
+#--------------------medicine--------------------#
+################################################
+# medical dataset is too large that both selmodel() and weightfunct() has issues in running selection model (due to the k*k matrix multiplication). So, we decided to split the dataset
+# split the data into chunks of 8000 rows each
+chunk_size <- 8000
+n_chunks <- ceiling(nrow(dat_med) / chunk_size)
+dat_chunks <- split(dat_med, rep(1:n_chunks, each = chunk_size, length.out = nrow(dat_med)))
+
+# apply the weightfunct () to each chunk and store the results
+selmod_med <- lapply(dat_chunks, function(chunk) {
+  tryCatch({
+    weightfunct(effect = chunk$mu_adj, v = chunk$se_adj^2, steps = c(.025, .10, .50, 1), table = TRUE)
+  }, error = function(e) {
+    message("Error in chunk: ", e)
+    return(NULL)
+  })
+})
+
+
+################################################
+#--------------------psychology--------------------#
+################################################
+
+a <- weightfunct(effect = dat_psy$mu_adj, v = dat_psy$se_adj^2, steps = c(.025,.10,.50,1), table = TRUE)
+
+```
+
+
+## Test of excess significance
+
+We use tes() in metafor to test the excess statistical significance. We further calculate tThe proportion of the research record that has been selected to be statistically significant, P(SSS), equals ESS/(1-Esig), where ESS is the difference between the observed proportion of statistically significant effects (Pss) and expected proportion assuming no selection for statistical significance (Esig). Details can be found at Tom's paper: Stanley T D, Doucouliagos H, Ioannidis J P A, et al. Detecting publication selection bias through excess statistical significance[J]. Research Synthesis Methods, 2021, 12(6): 776-795.
+
+
+```{r}
+################################################
+#--------------------economics--------------------#
+################################################
+# test of excess significance
+tes_eco <- tes(mu_adj, I(se_adj^2), data=dat_eco, test="binom") 
+# calculate P(SSS)
+Pss = tes_eco$O/tes_eco$k
+ESS = (tes_eco$O/tes_eco$k - tes_eco$E/tes_eco$k)
+Psss = ESS / (1 - tes_eco$E / tes_eco$k)
+
+################################################
+#--------------------environment--------------------#
+################################################
+# test of excess significance
+tes_env <- tes(mu_adj, I(se_adj^2), data=dat_env, test="binom")
+# calculate P(SSS)
+Pss = tes_env$O/tes_env$k
+ESS = (tes_env$O/tes_env$k - tes_env$E/tes_env$k)
+Psss = ESS / (1 - tes_env$E / tes_env$k)
+
+################################################
+#--------------------medicine--------------------#
+################################################
+# test of excess significance
+tes_med <- tes(mu_adj, I(se_adj^2), data=dat_med, test="binom")
+# calculate P(SSS)
+Pss = tes_med$O/tes_med$k
+ESS = (tes_med$O/tes_med$k - tes_med$E/tes_med$k)
+Psss = ESS / (1 - tes_med$E / tes_med$k)
+
+
+################################################
+#--------------------psychology--------------------#
+################################################
+# test of excess significance
+tes_psy <- tes(mu_adj, I(se_adj^2), data=dat_psy, test="binom")
+# calculate P(SSS)
+Pss = tes_psy$O/tes_psy$k
+ESS = (tes_psy$O/tes_psy$k - tes_psy$E/tes_psy$k)
+Psss = ESS / (1 - tes_psy$E / tes_psy$k)
+```
+
+
+# Figures
+
+## Figure 1
+
+```{r}
+################################################
+#--------------------economic--------------------#
+################################################
+#pval=c(seq(1.973175e-09,0.05,by=10e-9),0.05,0.01,0.001,0.0001) # 2 * pnorm(6, lower.tail = F) # z=6 leads to ~100% replication rate
+#zval=qnorm(1 - pval/2)
+zval <- sort(c(seq(1.96,8,by=0.001), 1.96, 2.58, 3.29, 3.890592))
+pval <- 2 * pnorm(zval, lower.tail = F)
+
+replicate <- sapply(zval,replcalc2,p=p_eco,m=m_eco,s=sigma_eco)
+rep_eco <- data.frame(pval,zval,replicate)
+rep_eco2 <- data.frame(zval = c(1.96, 2.58, 3.29, 3.890592)) %>% 
+  mutate(pval = 2 * pnorm(zval, lower.tail = F),
+         replicate = sapply(zval,replcalc2,p=p_eco,m=m_eco,s=sigma_eco))
+
+rep.dist.eco <- ggplot(data = rep_eco, aes(x = pval, y = replicate)) +
+  geom_line(linetype="solid", color="black", linewidth = 0.5) +
+  geom_ribbon(data = filter(rep_eco, pval <= 0.05 & pval >= 0.01), aes(pval, ymax=replicate, ymin=0), fill="#7BC4C5", alpha=0.2) +
+  geom_ribbon(data = filter(rep_eco, pval <= 0.01 & pval >= 0.001), aes(pval, ymax=replicate, ymin=0), fill="#7BC4C5", alpha=0.5) +
+  geom_ribbon(data = filter(rep_eco, pval <= 0.001), aes(pval, ymax=replicate, ymin=0), fill="#7BC4C5", alpha=1) + 
+  #geom_text(data = data.frame(x = c(2.27, 2.935, 4.645), label = c("Modest", "Strong", "Very Strong")), aes(x = x, y = 0.02, label = label), vjust = 0, size = 3, color = "black", alpha = 0.7) +
+  geom_point(data = rep_eco2, aes(x = pval, y = replicate), size = 3, shape = 19, color = "red") +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.2),
+                     minor_breaks=seq(0,1,0.05), expand = expansion(mult = c(0, 0.01)), labels = scales::percent_format(accuracy=1)) +
+  scale_x_continuous(breaks = c(0.001,0.01,0.05), labels = c(0.001,0.01,0.05), expand = expansion(mult = c(0.01, 0.018))) +
+  ylab("Replicability") + xlab(expression(paste("p-value"~italic()))) +
+  labs(colour = NULL, title = "Economics") + 
+  theme_bw() + 
+  theme(plot.title = element_text(size = 18),
+        axis.title = element_text(size = 18, color = "black"),
+        axis.text = element_text(size = 14, color = "black"),
+        #axis.text.x = element_blank(),
+        #axis.ticks.x = element_blank(),
+        panel.grid.major = element_line(color = "grey", linetype = "dotted"),
+        panel.grid.minor = element_line(color = "black", linetype = "dotted"))
+
+################################################
+#------------------environment------------------#
+################################################
+replicate <- sapply(zval,replcalc2,p=p_env,m=m_env,s=sigma_env)
+rep_env <- data.frame(pval,zval,replicate)
+rep_env2 <- data.frame(zval = c(1.96, 2.58, 3.29, 3.890592)) %>% 
+  mutate(pval = 2 * pnorm(zval, lower.tail = F),
+         replicate = sapply(zval,replcalc2,p=p_env,m=m_env,s=sigma_env))
+
+
+rep.dist.env <- ggplot(data = rep_env, aes(x = pval, y = replicate)) +
+  geom_line(linetype="solid", color="black", linewidth = 0.5) +
+  geom_ribbon(data = filter(rep_env, pval <= 0.05 & pval >= 0.01), aes(pval, ymax=replicate, ymin=0), fill="#7BC4C5", alpha=0.2) +
+  geom_ribbon(data = filter(rep_env, pval <= 0.01 & pval >= 0.001), aes(pval, ymax=replicate, ymin=0), fill="#7BC4C5", alpha=0.5) +
+  geom_ribbon(data = filter(rep_env, pval <= 0.001), aes(pval, ymax=replicate, ymin=0), fill="#7BC4C5", alpha=1) + 
+  #geom_text(data = data.frame(x = c(2.27, 2.935, 4.645), label = c("Modest", "Strong", "Very Strong")), aes(x = x, y = 0.02, label = label), vjust = 0, size = 3, color = "black", alpha = 0.7) +
+  geom_point(data = rep_env2, aes(x = pval, y = replicate), size = 3, shape = 19, color = "red") +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.2),
+                     minor_breaks=seq(0,1,0.05),expand = expansion(mult = c(0, 0.01)), labels = scales::percent_format(accuracy=1)) +
+  scale_x_continuous(breaks = c(0.001,0.01,0.05), labels = c(0.001,0.01,0.05), expand = expansion(mult = c(0.01, 0.018))) +
+  ylab("Replicability") + xlab(expression(paste("p-value"~italic()))) +
+  labs(colour = NULL, title = "Environment") + 
+  theme_bw() + 
+  theme(plot.title = element_text(size = 18),
+        axis.title = element_text(size = 18, color = "black"),
+        axis.text = element_text(size = 14, color = "black"),
+        #axis.text.x = element_blank(),
+        #axis.ticks.x = element_blank(),
+        panel.grid.major = element_line(color = "grey", linetype = "dotted"),
+        panel.grid.minor = element_line(color = "black", linetype = "dotted"))
+
+################################################
+#------------------medicine------------------#
+################################################
+replicate <- sapply(zval,replcalc2,p=p_med,m=m_med,s=sigma_med)
+rep_med <- data.frame(pval,zval,replicate)
+rep_med2 <- data.frame(zval = c(1.96, 2.58, 3.29, 3.890592)) %>% 
+  mutate(pval = 2 * pnorm(zval, lower.tail = F),
+         replicate = sapply(zval,replcalc2,p=p_med,m=m_med,s=sigma_med))
+
+rep.dist.med <- ggplot(data = rep_med, aes(x = pval, y = replicate)) +
+  geom_line(linetype="solid", color="black", linewidth = 0.5) +
+  geom_ribbon(data = filter(rep_med, pval <= 0.05 & pval >= 0.01), aes(pval, ymax=replicate, ymin=0), fill="#7BC4C5", alpha=0.2) +
+  geom_ribbon(data = filter(rep_med, pval <= 0.01 & pval >= 0.001), aes(pval, ymax=replicate, ymin=0), fill="#7BC4C5", alpha=0.5) +
+  geom_ribbon(data = filter(rep_med, pval <= 0.001), aes(pval, ymax=replicate, ymin=0), fill="#7BC4C5", alpha=1) + 
+  #geom_text(data = data.frame(x = c(2.27, 2.935, 4.645), label = c("Modest", "Strong", "Very Strong")), aes(x = x, y = 0.02, label = label), vjust = 0, size = 3, color = "black", alpha = 0.7) +
+  geom_point(data = rep_med2, aes(x = pval, y = replicate), size = 3, shape = 19, color = "red") +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.2),
+                     minor_breaks=seq(0,1,0.05),expand = expansion(mult = c(0, 0.01)), labels = scales::percent_format(accuracy=1)) +
+  scale_x_continuous(breaks = c(0.001,0.01,0.05), labels = c(0.001,0.01,0.05), expand = expansion(mult = c(0.01, 0.018))) +
+  ylab("Replicability") + xlab(expression(paste("p-value"~italic()))) +
+  labs(colour = NULL, title = "Medicine") + 
+  theme_bw() + 
+  theme(plot.title = element_text(size = 18),
+        axis.title = element_text(size = 18, color = "black"),
+        axis.text = element_text(size = 14, color = "black"),
+        #axis.text.x = element_blank(),
+        #axis.ticks.x = element_blank(),
+        panel.grid.major = element_line(color = "grey", linetype = "dotted"),
+        panel.grid.minor = element_line(color = "black", linetype = "dotted"))
+
+
+################################################
+#------------------psychology------------------#
+################################################
+replicate <- sapply(zval,replcalc2,p=p_psy,m=m_psy,s=sigma_psy)
+rep_psy <- data.frame(pval,zval,replicate)
+rep_psy2 <- data.frame(zval = c(1.96, 2.58, 3.29, 3.890592)) %>% 
+  mutate(pval = 2 * pnorm(zval, lower.tail = F),
+         replicate = sapply(zval,replcalc2,p=p_psy,m=m_psy,s=sigma_psy))
+
+
+rep.dist.psy <- ggplot(data = rep_psy, aes(x = pval, y = replicate)) +
+  geom_line(linetype="solid", color="black", linewidth = 0.5) +
+  geom_ribbon(data = filter(rep_psy, pval <= 0.05 & pval >= 0.01), aes(pval, ymax=replicate, ymin=0), fill="#7BC4C5", alpha=0.2) +
+  geom_ribbon(data = filter(rep_psy, pval <= 0.01 & pval >= 0.001), aes(pval, ymax=replicate, ymin=0), fill="#7BC4C5", alpha=0.5) +
+  geom_ribbon(data = filter(rep_psy, pval <= 0.001), aes(pval, ymax=replicate, ymin=0), fill="#7BC4C5", alpha=1) + 
+  #geom_text(data = data.frame(x = c(2.27, 2.935, 4.645), label = c("Modest", "Strong", "Very Strong")), aes(x = x, y = 0.02, label = label), vjust = 0, size = 3, color = "black", alpha = 0.7) +
+  geom_point(data = rep_psy2, aes(x = pval, y = replicate), size = 3, shape = 19, color = "red") +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.2),
+                     minor_breaks=seq(0,1,0.05),expand = expansion(mult = c(0, 0.01)), labels = scales::percent_format(accuracy=1)) +
+  scale_x_continuous(breaks = c(0.001,0.01,0.05), labels = c(0.001,0.01,0.05), expand = expansion(mult = c(0.01, 0.018))) +
+  ylab("Replicability") + xlab(expression(paste("p-value"~italic()))) +
+  labs(colour = NULL, title = "Psychology") + 
+  theme_bw() + 
+  theme(plot.title = element_text(size = 18),
+        axis.title = element_text(size = 18, color = "black"),
+        axis.text = element_text(size = 14, color = "black"),
+        #axis.text.x = element_blank(),
+        #axis.ticks.x = element_blank(),
+        panel.grid.major = element_line(color = "grey", linetype = "dotted"),
+        panel.grid.minor = element_line(color = "black", linetype = "dotted"))
+
+# assembly
+png(filename = "figure1.png", width = 14, height = 12, units = "in", type = "windows", res = 400)
+rep.dist.med + rep.dist.eco + rep.dist.env +  rep.dist.psy + plot_layout(nrow = 2, ncol = 2) + plot_annotation(tag_levels = list(c('A', 'B', 'C', 'D'))) & theme(plot.tag = element_text(size = 18, face = "bold"))
+dev.off()
+
+```
+
+
+## Figure2A
+Prior odds
+```{r}
+# figure
+dat$R <- c(dat_eco$R, dat_env$R, dat_med$R, dat_psy$R)
+df <- dat %>% select(id, discipline, R)
+df$discipline <- as.factor(df$discipline)
+df$discipline <- factor(df$discipline, levels = c("environmental", "psychology", "economics", "medicine"))
+
+p_R <- ggplot(df, aes(x = R, y = discipline, fill = discipline)) +
+  geom_density_ridges(color = "white", alpha = 0.5,
+                      rel_min_height = 0.002,
+                      scale = 1,
+                      quantile_lines = TRUE) +
+  #viridis::scale_fill_viridis(option = "viridis", discrete = T) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.2),
+                     minor_breaks=seq(0,1,0.05),expand = expansion(mult = c(0, 0.015)), labels = scales::percent_format(accuracy=1)) +
+  scale_y_discrete(labels = c("Environment", "Psychology", "Economics", "Medicine"), expand = expansion(mult = c(0.01, 0.25))) +
+  guides(fill = "none") +
+  labs(x = "Pre-study probability", y = "") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.title.y = element_blank(),
+        panel.grid.major = element_line(color = "grey", linetype = "dotted"),
+        panel.grid.minor = element_line(color = "black", linetype = "dotted"))
+
+```
+
+## Figure2B
+Statistical power
+```{r}
+# figure
+df <- dat %>% select(id, discipline, pwr_adj)
+df$discipline <- as.factor(df$discipline)
+df$discipline <- factor(df$discipline, levels = c("environmental", "psychology", "economics", "medicine"))
+
+p_pwr <- ggplot(df, aes(x = pwr_adj, y = discipline, fill = discipline)) +
+  geom_density_ridges(color = "white", alpha = 0.5,
+                      rel_min_height = 0.002,
+                      scale = 1,
+                      quantile_lines = TRUE) +
+  #viridis::scale_fill_viridis(option = "viridis", discrete = T) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.2),
+                     minor_breaks=seq(0,1,0.05),expand = expansion(mult = c(0, 0.015)), labels = scales::percent_format(accuracy=1)) +
+  scale_y_discrete(labels = c("Environment", "Psychology", "Economics", "Medicine"), expand = expansion(mult = c(0.01, 0.25))) +
+  guides(fill = "none") +
+  labs(x = "Statistical power", y = "") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.title.y = element_blank(),
+        panel.grid.major = element_line(color = "grey", linetype = "dotted"),
+        panel.grid.minor = element_line(color = "black", linetype = "dotted"))
+```
+
+
+## Figure2C
+
+Type M error
+
+```{r}
+# figure
+df <- dat %>% select(id, discipline, M_adj)
+df$discipline <- as.factor(df$discipline)
+df$discipline <- factor(df$discipline, levels = c("environmental", "psychology", "economics", "medicine"))
+
+p_M <- ggplot(filter(df,M_adj<=4), aes(x = M_adj, y = discipline, fill = discipline)) +
+  geom_density_ridges(color = "white", alpha = 0.5, stat = "binline", bins = 20, scale = 0.95, draw_baseline = FALSE) +
+  scale_x_continuous(limits = c(1, 4), breaks = seq(1, 4, by = 0.5),
+                     minor_breaks=seq(1,4,0.1),expand = expansion(mult = c(0, 0.015))) +
+  scale_y_discrete(labels = c("Environment", "Psychology", "Economics", "Medicine"), expand = expansion(mult = c(0.01, 0.25))) +
+  guides(fill = "none") +
+  labs(x = "Magnitude error", y = "") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.title.y = element_blank(),
+        panel.grid.major = element_line(color = "grey", linetype = "dotted"),
+        panel.grid.minor = element_line(color = "black", linetype = "dotted"))
+```
+
+## Figure2D
+
+Type S error
+
+```{r}
+# figure
+df <- dat %>% select(id, discipline, S_adj)
+df$discipline <- as.factor(df$discipline)
+df$discipline <- factor(df$discipline, levels = c("environmental", "psychology", "economics", "medicine"))
+
+p_S <- ggplot(filter(df, S_adj<=0.1), aes(x = S_adj, y = discipline, fill = discipline)) +
+  geom_density_ridges(color = "white", alpha = 0.5, stat = "binline", bins = 20, scale = 0.85, draw_baseline = FALSE) +
+  scale_x_continuous(limits = c(0, 0.1), breaks = seq(0, 0.1, by = 0.01),
+                     minor_breaks=seq(0,0.1,0.005),expand = expansion(mult = c(0, 0.015)), labels = scales::percent_format(accuracy=1)) +
+  scale_y_discrete(labels = c("Environment", "Psychology", "Economics", "Medicine"), expand = expansion(mult = c(0.01, 0.25))) +
+  guides(fill = "none") +
+  labs(x = "Sign error", y = "") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.title.y = element_blank(),
+        panel.grid.major = element_line(color = "grey", linetype = "dotted"),
+        panel.grid.minor = element_line(color = "black", linetype = "dotted"))
+
+
+# layout
+png(filename = "figure2.png", width = 5, height = 10, units = "in", type = "windows", res = 400)
+p_R + p_pwr + p_M + p_S + plot_layout(ncol = 1, nrow = 4) + plot_annotation(tag_levels = "A") & theme(plot.tag = element_text(size = 14, face = "bold"))
+
+```
+
+
+
+# ES benchmark
+
+```{r}
+## folded mean
+folded_es <-function(mean, variance){ # the sampling variance of magnitude   
+  mu <- mean
+  sigma <- sqrt(variance)
+  fold_mu <- sigma*sqrt(2/pi)*exp((-mu^2)/(2*sigma^2)) + mu*(1 - 2*pnorm(-mu/sigma))
+  fold_mu
+}
+## folded variance
+folded_var <- function(mean, variance){ # the sampling variance of magnitude   
+  mu <- mean
+  sigma <- sqrt(variance)
+  fold_mu <- sigma*sqrt(2/pi)*exp((-mu^2)/(2*sigma^2)) + mu*(1 - 2*pnorm(-mu/sigma))
+  fold_se <- sqrt(mu^2 + sigma^2 - fold_mu^2)
+  # adding se to make bigger mean
+  fold_v <- fold_se^2
+  fold_v
+}
+
+df <- dat
+df <- df %>% mutate(folded_mu_adj = folded_es(mu_adj,I(se_adj^2)),
+                    folded_var_adj = folded_var(mu_adj,I(se_adj^2)))
+
+
+df_eco <- df %>% filter(discipline == "economics")
+df_env <- df %>% filter(discipline == "environmental")
+df_med <- df %>% filter(discipline == "medicine")
+df_psy <- df %>% filter(discipline == "psychology")
+
+# RE
+res_med <- rma.mv(yi = folded_mu_adj, V = folded_var_adj, random = ~ 1 | id, method = "REML", sparse = T, data = df_med, verbose = T)
+
+```
+
