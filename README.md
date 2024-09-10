@@ -1,15 +1,13 @@
 # Reproducibility package
 
-## Transparency declaration
-
-The authors affirm that the manuscript is an honest, accurate, and transparent account of the study being reported, and no important
-aspects of the study have been omitted.
-
-## Reproducibility declaration
-
 This repository contains all data and code that can be used to reproduce all results reported in the following manuscript:
 
 > Yefeng Yang, František Bartoš, Maximilian Maier, T. D. Stanley, Malgorzata Lagisz, & Shinichi Nakagawa. Credibility crisis: quantitative analysis of the trustworthiness of science. 2024.
+
+## Transparency and reproducibility declaration
+
+The authors affirm that the manuscript is an honest, accurate, and transparent account of the study being reported, and no important
+aspects of the study have been omitted. All results and figures reported in the main text and supplementary materials are fully reproducible.
 
 ## Structure
 
