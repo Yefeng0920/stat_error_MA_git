@@ -15,7 +15,7 @@ This repository contains all data and code that can be used to reproduce all res
 
 The repository contains 4 folders:
 
-- `Data`
+- `Dat`
 
 - `Figure`
 
@@ -23,9 +23,9 @@ The repository contains 4 folders:
 
 - `R`
  
-### `Data` folder
+### `Dat` folder
 
-The `Data` folder includes raw data for replicating all analyses and results reported in the paper.
+The `Dat` folder includes raw data for replicating all analyses and results reported in the paper.
 
 ### `Figure` folder
 
