@@ -9,7 +9,7 @@ aspects of the study have been omitted.
 
 This repository contains all data and code that can be used to reproduce all results reported in the following manuscript:
 
-> Yefeng Yang1, František Bartoš, Maximilian Maier, T. D. Stanley, Malgorzata Lagisz, & Shinichi Nakagawa. Credibility crisis: quantitative analysis of the trustworthiness of science. 2024.
+> Yefeng Yang, František Bartoš, Maximilian Maier, T. D. Stanley, Malgorzata Lagisz, & Shinichi Nakagawa. Credibility crisis: quantitative analysis of the trustworthiness of science. 2024.
 
 ## Structure
 
