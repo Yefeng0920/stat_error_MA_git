@@ -1,6 +1,6 @@
 # Reproducibility package
 
-This repository contains all data and code that can be used to reproduce all results reported in the following manuscript:
+This repository contains all data and code that can be used to reproduce all results and figures reported in the following manuscript:
 
 > Yefeng Yang, František Bartoš, Maximilian Maier, T. D. Stanley, Malgorzata Lagisz, & Shinichi Nakagawa. Credibility crisis: quantitative analysis of the trustworthiness of science. 2024.
 
