@@ -15,7 +15,7 @@ The repository contains 4 folders:
 
 - `Dat`
 
-- `Figure`
+- `Fig`
 
 - `Func`
 
@@ -25,13 +25,13 @@ The repository contains 4 folders:
 
 The `Dat` folder includes raw data for replicating all analyses and results reported in the paper.
 
-### `Figure` folder
+### `Fig` folder
 
-The `Figure` folder includes two subfolders:
+The `Fig` folder includes two subfolders:
 
-`Main` contains the figures reported in the main text,
+`main` contains the figures reported in the main text,
 
-`Supplement` contains the supplementary figures.
+`supplement` contains the supplementary figures.
 
 ### `Func` folder
 
